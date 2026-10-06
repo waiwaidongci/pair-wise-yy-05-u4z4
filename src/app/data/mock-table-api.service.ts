@@ -1,9 +1,8 @@
 import { Injectable } from '@angular/core';
-import { Observable, of } from 'rxjs';
-import { delay } from 'rxjs/operators';
+import { Observable, of, throwError } from 'rxjs';
+import { delay, mergeMap } from 'rxjs/operators';
 import {
   AggregateResult,
-  CellValue,
   FilterCondition,
   FilterGroup,
   FilterNode,
@@ -18,9 +17,21 @@ const CATEGORIES = ['云服务', '智能硬件', '企业软件', '数据服务',
 const OWNERS = ['陈嘉', '林月', '周砺', '许宁', '韩舟', '顾清', '沈河', '陆遥'];
 const STATUSES: TableRow['status'][] = ['待审核', '进行中', '已发货', '已完成', '异常'];
 
+/** 故障注入模式：模拟大促期间接口不稳定，便于验证“失败保留快照 + 重试” */
+export type MockFailureMode = 'off' | 'random' | 'always';
+
 @Injectable({ providedIn: 'root' })
 export class MockTableApiService {
   private readonly rows: TableRow[] = this.createRows(50000);
+  private failureMode: MockFailureMode = 'off';
+
+  setFailureMode(mode: MockFailureMode): void {
+    this.failureMode = mode;
+  }
+
+  getFailureMode(): MockFailureMode {
+    return this.failureMode;
+  }
 
   query(request: QueryRequest): Observable<QueryResult> {
     const startedAt = performance.now();
@@ -52,18 +63,38 @@ export class MockTableApiService {
       );
     }
 
-    const elapsedMs = Math.max(8, Math.round(performance.now() - startedAt + 18));
-    return of({
+    const result: QueryResult = {
       rows: pageRows,
       total,
       aggregates: this.aggregate(sorted),
       groups,
-      elapsedMs,
-    }).pipe(delay(request.page > 8 ? 120 : 55));
+      elapsedMs: Math.max(8, Math.round(performance.now() - startedAt + 18)),
+    };
+    // 随机延迟 80–800ms：连续切换条件时响应会乱序返回，由查询版本号保证旧结果作废
+    const latency = 80 + Math.floor(Math.random() * 720);
+    return of(null).pipe(
+      delay(latency),
+      mergeMap(() => {
+        if (this.shouldFail()) {
+          return throwError(() => new Error('模拟服务端繁忙（HTTP 503），请从出错的那次重试'));
+        }
+        return of(result);
+      }),
+    );
   }
 
   getDatasetSize(): number {
     return this.rows.length;
+  }
+
+  private shouldFail(): boolean {
+    if (this.failureMode === 'always') {
+      return true;
+    }
+    if (this.failureMode === 'random') {
+      return Math.random() < 0.35;
+    }
+    return false;
   }
 
   private filterRows(rows: TableRow[], filter: FilterGroup, search: string): TableRow[] {

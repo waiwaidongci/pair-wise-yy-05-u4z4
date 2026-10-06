@@ -1,14 +1,11 @@
 import { createReducer, on } from '@ngrx/store';
 import {
-  AggregateResult,
   FilterGroup,
-  SavedView,
   TableRow,
   TableState,
 } from '../types/table.models';
+import { readStoredViews } from '../data/view-repository.service';
 import * as TableActions from './table.actions';
-
-const EMPTY_AGGREGATE: AggregateResult = { amount: 0, quantity: 0, averageMargin: 0 };
 
 export const EMPTY_FILTER: FilterGroup = {
   kind: 'group',
@@ -38,15 +35,12 @@ const initialWidths = Object.fromEntries(
   ]),
 );
 
-const initialViews = readViews();
-
 export const initialState: TableState = {
-  rows: [],
-  total: 0,
-  groups: [],
-  aggregates: EMPTY_AGGREGATE,
+  snapshot: null,
+  requestVersion: 0,
   loading: false,
   error: null,
+  failedQuery: null,
   page: 0,
   pageSize: 100,
   sort: { field: 'updatedAt', direction: 'desc' },
@@ -60,43 +54,93 @@ export const initialState: TableState = {
   columnWidths: initialWidths,
   pinnedColumns: ['orderNo', 'customer'],
   density: 'standard',
-  elapsedMs: 0,
-  savedViews: initialViews,
+  savedViews: readStoredViews(),
   activeViewId: null,
+  pendingViewConflict: null,
   dirtyCells: {},
 };
 
+/**
+ * 查询条件一旦改动：版本号 +1，此前发出的所有慢响应随之作废；
+ * 同时清掉上一次失败记录（它属于旧条件），快照保留到新结果到达为止。
+ */
+function invalidate(state: TableState) {
+  return {
+    requestVersion: state.requestVersion + 1,
+    loading: true,
+    error: null,
+    failedQuery: null,
+  };
+}
+
 export const tableReducer = createReducer(
   initialState,
-  on(TableActions.loadPage, (state) => ({ ...state, loading: true, error: null })),
-  on(TableActions.loadPageSuccess, (state, { result }) => ({
-    ...state,
-    rows: result.rows.map((row) => {
+  on(TableActions.loadPage, (state) => ({ ...state, ...invalidate(state) })),
+  on(TableActions.loadPageSuccess, (state, { version, request, result }) => {
+    if (version !== state.requestVersion) {
+      // 慢查询乱序返回的旧版本结果，直接丢弃，不允许覆盖新条件
+      return state;
+    }
+    const rows = result.rows.map((row) => {
       const dirty = Object.entries(state.dirtyCells).reduce<TableRow>((current, [key, value]) => {
         const [id, field] = key.split('::');
         return current.id === id ? { ...current, [field]: value } : current;
       }, row);
       return dirty;
-    }),
-    total: result.total,
-    groups: result.groups,
-    aggregates: result.aggregates,
-    loading: false,
-    elapsedMs: result.elapsedMs,
+    });
+    return {
+      ...state,
+      // 分页、汇总、导出共用的一份快照，整体原子替换
+      snapshot: {
+        version,
+        request,
+        rows,
+        total: result.total,
+        groups: result.groups,
+        aggregates: result.aggregates,
+        elapsedMs: result.elapsedMs,
+        receivedAt: new Date().toISOString(),
+      },
+      loading: false,
+      error: null,
+      failedQuery: null,
+    };
+  }),
+  on(TableActions.loadPageFailure, (state, { version, request, error }) => {
+    if (version !== state.requestVersion) {
+      return state;
+    }
+    // 保留上一次可用快照（snapshot 不动），只记录出错的那次查询供重试
+    return {
+      ...state,
+      loading: false,
+      error,
+      failedQuery: { version, request, error, failedAt: new Date().toISOString() },
+    };
+  }),
+  on(TableActions.retryFailedQuery, (state) =>
+    state.failedQuery
+      ? { ...state, requestVersion: state.requestVersion + 1, loading: true, error: null }
+      : state,
+  ),
+  on(TableActions.setPage, (state, { page }) => ({ ...state, page, ...invalidate(state) })),
+  on(TableActions.setPageSize, (state, { pageSize }) => ({ ...state, pageSize, page: 0, ...invalidate(state) })),
+  on(TableActions.setSort, (state, { sort }) => ({ ...state, sort, page: 0, ...invalidate(state) })),
+  on(TableActions.setFilter, (state, { filter }) => ({ ...state, filter, page: 0, ...invalidate(state) })),
+  on(TableActions.setSearch, (state, { search }) => ({ ...state, search, page: 0, ...invalidate(state) })),
+  on(TableActions.setGroupBy, (state, { groupBy }) => ({ ...state, groupBy, page: 0, ...invalidate(state) })),
+  on(TableActions.toggleTreeMode, (state) => ({
+    ...state,
+    treeMode: !state.treeMode,
+    page: 0,
+    ...invalidate(state),
   })),
-  on(TableActions.loadPageFailure, (state, { error }) => ({ ...state, loading: false, error })),
-  on(TableActions.setPage, (state, { page }) => ({ ...state, page })),
-  on(TableActions.setPageSize, (state, { pageSize }) => ({ ...state, pageSize, page: 0 })),
-  on(TableActions.setSort, (state, { sort }) => ({ ...state, sort, page: 0 })),
-  on(TableActions.setFilter, (state, { filter }) => ({ ...state, filter, page: 0 })),
-  on(TableActions.setSearch, (state, { search }) => ({ ...state, search, page: 0 })),
-  on(TableActions.setGroupBy, (state, { groupBy }) => ({ ...state, groupBy, page: 0 })),
-  on(TableActions.toggleTreeMode, (state) => ({ ...state, treeMode: !state.treeMode, page: 0 })),
   on(TableActions.toggleExpanded, (state, { id }) => ({
     ...state,
     expandedIds: state.expandedIds.includes(id)
       ? state.expandedIds.filter((item) => item !== id)
       : [...state.expandedIds, id],
+    ...invalidate(state),
   })),
   on(TableActions.setSelection, (state, { ids }) => ({ ...state, selectedIds: ids })),
   on(TableActions.toggleColumn, (state, { key }) => ({
@@ -118,27 +162,25 @@ export const tableReducer = createReducer(
   on(TableActions.setDensity, (state, { density }) => ({ ...state, density })),
   on(TableActions.updateCell, (state, { id, key, value }) => ({
     ...state,
-    rows: state.rows.map((row) => (row.id === id ? { ...row, [key]: value } : row)),
+    snapshot: state.snapshot
+      ? {
+          ...state.snapshot,
+          rows: state.snapshot.rows.map((row) => (row.id === id ? { ...row, [key]: value } : row)),
+        }
+      : state.snapshot,
     dirtyCells: { ...state.dirtyCells, [`${id}::${String(key)}`]: value },
   })),
-  on(TableActions.saveView, (state, { name }) => {
-    const view: SavedView = {
-      id: `view-${Date.now()}`,
-      name: name.trim(),
-      createdAt: new Date().toISOString(),
-      pageSize: state.pageSize,
-      visibleColumns: [...state.visibleColumns],
-      columnWidths: { ...state.columnWidths },
-      pinnedColumns: [...state.pinnedColumns],
-      sort: state.sort,
-      filter: state.filter,
-      groupBy: state.groupBy,
-      treeMode: state.treeMode,
-    };
-    const savedViews = [...state.savedViews.filter((item) => item.name !== view.name), view];
-    persistViews(savedViews);
-    return { ...state, savedViews, activeViewId: view.id };
-  }),
+  on(TableActions.saveViewSuccess, (state, { views, activeViewId }) => ({
+    ...state,
+    savedViews: views,
+    activeViewId,
+    pendingViewConflict: null,
+  })),
+  on(TableActions.saveViewConflict, (state, { conflict }) => ({
+    ...state,
+    pendingViewConflict: conflict,
+  })),
+  on(TableActions.cancelViewConflict, (state) => ({ ...state, pendingViewConflict: null })),
   on(TableActions.applyView, (state, { view }) => ({
     ...state,
     pageSize: view.pageSize,
@@ -151,27 +193,11 @@ export const tableReducer = createReducer(
     treeMode: view.treeMode,
     activeViewId: view.id,
     page: 0,
+    ...invalidate(state),
   })),
-  on(TableActions.deleteView, (state, { id }) => {
-    const savedViews = state.savedViews.filter((view) => view.id !== id);
-    persistViews(savedViews);
-    return {
-      ...state,
-      savedViews,
-      activeViewId: state.activeViewId === id ? null : state.activeViewId,
-    };
-  }),
+  on(TableActions.deleteView, (state, { id }) => ({
+    ...state,
+    savedViews: state.savedViews.filter((view) => view.id !== id),
+    activeViewId: state.activeViewId === id ? null : state.activeViewId,
+  })),
 );
-
-function readViews(): SavedView[] {
-  try {
-    const raw = localStorage.getItem('pair-wise-yy-05:views');
-    return raw ? (JSON.parse(raw) as SavedView[]) : [];
-  } catch {
-    return [];
-  }
-}
-
-function persistViews(views: SavedView[]): void {
-  localStorage.setItem('pair-wise-yy-05:views', JSON.stringify(views));
-}

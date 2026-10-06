@@ -1,9 +1,10 @@
 import { CommonModule } from '@angular/common';
-import { Component, computed, inject, signal } from '@angular/core';
+import { Component, computed, effect, inject, signal } from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { FormsModule } from '@angular/forms';
 import { MatButtonModule } from '@angular/material/button';
 import { MatChipsModule } from '@angular/material/chips';
-import { MatDialogModule } from '@angular/material/dialog';
+import { MatDialog, MatDialogModule } from '@angular/material/dialog';
 import { MatDividerModule } from '@angular/material/divider';
 import { MatFormFieldModule } from '@angular/material/form-field';
 import { MatIconModule } from '@angular/material/icon';
@@ -16,17 +17,28 @@ import { MatSidenavModule } from '@angular/material/sidenav';
 import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
 import { MatToolbarModule } from '@angular/material/toolbar';
 import { MatTooltipModule } from '@angular/material/tooltip';
+import { Actions, ofType } from '@ngrx/effects';
 import { Store } from '@ngrx/store';
 import { DataGridComponent, GridColumn } from './components/data-grid/data-grid.component';
 import { FilterBuilderComponent } from './components/filter-builder/filter-builder.component';
+import { ViewConflictDialogComponent } from './components/view-conflict-dialog/view-conflict-dialog.component';
+import { MockFailureMode, MockTableApiService } from './data/mock-table-api.service';
 import * as TableActions from './stores/table.actions';
 import {
   selectAllColumnDefinitions,
   selectPageCount,
+  selectPendingViewConflict,
+  selectSnapshot,
   selectTableState,
   selectVisibleColumnDefinitions,
 } from './stores/table.selectors';
 import { FilterGroup, SavedView, SortState, TableRow } from './types/table.models';
+
+const API_MODE_LABELS: Record<MockFailureMode, string> = {
+  off: '正常',
+  random: '偶发失败',
+  always: '始终失败',
+};
 
 @Component({
   selector: 'app-root',
@@ -54,6 +66,7 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
   ],
   template: `
     @let state = tableState();
+    @let snap = snapshot();
     <mat-toolbar class="app-toolbar">
       <div class="brand">
         <span class="brand__mark"><mat-icon>dataset</mat-icon></span>
@@ -85,7 +98,7 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
           >
             <mat-icon>table_view</mat-icon>
             全部订单
-            <span>{{ state.total | number }}</span>
+            <span>{{ (snap?.total ?? 0) | number }}</span>
           </button>
           @for (view of state.savedViews; track view.id) {
             <button
@@ -99,6 +112,16 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
               <span class="view-link__delete" (click)="deleteView($event, view.id)">×</span>
             </button>
           }
+          <button
+            class="peer-simulate"
+            type="button"
+            [disabled]="!state.savedViews.length"
+            matTooltip="模拟另一个人在其它终端保存了同名视图，用于演示保存冲突"
+            (click)="simulatePeerEdit()"
+          >
+            <mat-icon>group_add</mat-icon>
+            模拟同事改视图
+          </button>
         </div>
 
         <mat-divider />
@@ -107,7 +130,7 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
           <p class="side-panel__eyebrow">数据概况</p>
           <div class="metric">
             <span>筛选后订单</span>
-            <strong>{{ state.total | number }}</strong>
+            <strong>{{ (snap?.total ?? 0) | number }}</strong>
           </div>
           <div class="metric">
             <span>订单总额</span>
@@ -115,7 +138,7 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
           </div>
           <div class="metric">
             <span>平均毛利率</span>
-            <strong>{{ state.aggregates.averageMargin }}%</strong>
+            <strong>{{ snap?.aggregates?.averageMargin ?? 0 }}%</strong>
           </div>
           <div class="metric">
             <span>当前选择</span>
@@ -142,11 +165,21 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
             <p>服务端分页查询、复杂表达式筛选、聚合分析与可复用列视图。</p>
           </div>
           <div class="page-actions">
+            <button mat-stroked-button type="button" [matMenuTriggerFor]="apiMenu">
+              <mat-icon>cloud_queue</mat-icon>
+              接口：{{ apiModeLabel() }}
+            </button>
+            <mat-menu #apiMenu="matMenu">
+              <div class="menu-title">故障注入（演示用）</div>
+              <button mat-menu-item type="button" (click)="setApiMode('off')">正常 · 随机延迟 80–800ms</button>
+              <button mat-menu-item type="button" (click)="setApiMode('random')">偶发失败</button>
+              <button mat-menu-item type="button" (click)="setApiMode('always')">始终失败</button>
+            </mat-menu>
             <button mat-stroked-button type="button" (click)="refresh()">
               <mat-icon>refresh</mat-icon>
               刷新
             </button>
-            <button mat-flat-button color="primary" type="button" (click)="exportCsv()">
+            <button mat-flat-button color="primary" type="button" [disabled]="!snap" (click)="exportCsv()">
               <mat-icon>download</mat-icon>
               导出本页
             </button>
@@ -242,9 +275,25 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
           }
         </section>
 
-        @if (state.groups.length) {
+        @if (state.error) {
+          <section class="error-banner" role="alert">
+            <mat-icon>error_outline</mat-icon>
+            <div class="error-banner__text">
+              <strong>查询失败：{{ state.error }}</strong>
+              <span>
+                已保留上一次可用快照{{ snap ? '（v' + snap.version + '）' : '' }}，可从出错的那次重试。
+              </span>
+            </div>
+            <button mat-stroked-button type="button" [disabled]="state.loading" (click)="retry()">
+              <mat-icon>replay</mat-icon>
+              {{ state.loading ? '重试中…' : '重试' }}
+            </button>
+          </section>
+        }
+
+        @if (snap?.groups?.length) {
           <section class="group-strip">
-            @for (group of state.groups.slice(0, 6); track group.key) {
+            @for (group of snap?.groups?.slice(0, 6) ?? []; track group.key) {
               <button type="button" class="group-card" (click)="filterGroup(group.key)">
                 <span>{{ group.key }}</span>
                 <strong>{{ group.count | number }} 单</strong>
@@ -257,9 +306,12 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
         <section class="table-panel">
           <div class="table-statusbar">
             <span class="live-dot"></span>
-            <strong>{{ state.total | number }}</strong> 条结果
+            <strong>{{ (snap?.total ?? 0) | number }}</strong> 条结果
             <span class="muted">· 第 {{ state.page + 1 }} / {{ pageCount() }} 页</span>
-            <span class="muted">· 查询 {{ state.elapsedMs }}ms</span>
+            @if (snap) {
+              <span class="muted">· 快照 v{{ snap.version }}</span>
+              <span class="muted">· 查询 {{ snap.elapsedMs }}ms</span>
+            }
             @if (state.selectedIds.length) {
               <span class="selection-note">已选择 {{ state.selectedIds.length }} 行</span>
             }
@@ -270,7 +322,7 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
             <mat-progress-bar mode="indeterminate" />
           }
           <app-data-grid
-            [rows]="state.rows"
+            [rows]="snap?.rows ?? []"
             [columns]="visibleColumns()"
             [loading]="state.loading"
             [density]="state.density"
@@ -287,7 +339,7 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
             (inspect)="showRow($event)"
           />
           <mat-paginator
-            [length]="state.total"
+            [length]="snap?.total ?? 0"
             [pageIndex]="state.page"
             [pageSize]="state.pageSize"
             [pageSizeOptions]="[50, 100, 200, 500]"
@@ -416,6 +468,31 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
       padding: 0 4px;
       color: #98a2b3;
     }
+    .peer-simulate {
+      display: flex;
+      width: 100%;
+      align-items: center;
+      gap: 8px;
+      margin-top: 6px;
+      padding: 8px 10px;
+      border: 1px dashed #cfd6e2;
+      border-radius: 7px;
+      background: transparent;
+      color: #667085;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .peer-simulate:hover:not(:disabled) {
+      border-color: #84adff;
+      color: #175cd3;
+    }
+    .peer-simulate:disabled {
+      cursor: not-allowed;
+      opacity: .5;
+    }
+    .peer-simulate mat-icon {
+      font-size: 18px;
+    }
     .metric {
       display: flex;
       align-items: baseline;
@@ -539,6 +616,34 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
       color: #667085;
       font-size: 12px;
     }
+    .error-banner {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-top: 12px;
+      padding: 10px 14px;
+      border: 1px solid #fecdca;
+      border-radius: 10px;
+      background: #fffbfa;
+      color: #b42318;
+    }
+    .error-banner > mat-icon {
+      flex-shrink: 0;
+    }
+    .error-banner__text {
+      display: flex;
+      min-width: 0;
+      flex: 1;
+      flex-direction: column;
+      gap: 2px;
+      font-size: 12px;
+    }
+    .error-banner__text strong {
+      font-size: 13px;
+    }
+    .error-banner__text span {
+      color: #7a271a;
+    }
     .group-strip {
       display: grid;
       grid-template-columns: repeat(6, minmax(130px, 1fr));
@@ -631,28 +736,75 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
 })
 export class AppComponent {
   private readonly store = inject(Store);
+  private readonly actions$ = inject(Actions);
   private readonly snackBar = inject(MatSnackBar);
+  private readonly dialog = inject(MatDialog);
+  private readonly mockApi = inject(MockTableApiService);
 
   readonly tableState = this.store.selectSignal(selectTableState);
+  readonly snapshot = this.store.selectSignal(selectSnapshot);
+  readonly pendingConflict = this.store.selectSignal(selectPendingViewConflict);
   readonly allColumns = this.store.selectSignal(selectAllColumnDefinitions);
   readonly visibleColumns = this.store.selectSignal(selectVisibleColumnDefinitions) as unknown as () => GridColumn[];
   readonly pageCount = this.store.selectSignal(selectPageCount);
   readonly showFilterPanel = signal(false);
+  readonly apiMode = signal<MockFailureMode>('off');
+  readonly apiModeLabel = computed(() => API_MODE_LABELS[this.apiMode()]);
   readonly conditionCount = computed(() => this.countConditions(this.tableState().filter));
   readonly compactAmount = computed(() => {
-    const amount = this.tableState().aggregates.amount;
+    const amount = this.snapshot()?.aggregates.amount ?? 0;
     if (amount >= 100000000) return `${(amount / 100000000).toFixed(2)} 亿`;
     if (amount >= 10000) return `${(amount / 10000).toFixed(1)} 万`;
     return amount.toLocaleString('zh-CN');
   });
 
+  private conflictDialogOpen = false;
+
   constructor() {
     this.store.dispatch(TableActions.loadPage({ refresh: true }));
+
+    // 保存视图发生冲突时，先弹出双方差异，确认后才覆盖
+    effect(() => {
+      const conflict = this.pendingConflict();
+      if (conflict && !this.conflictDialogOpen) {
+        this.conflictDialogOpen = true;
+        const ref = this.dialog.open(ViewConflictDialogComponent, {
+          data: conflict,
+          disableClose: true,
+          width: '680px',
+        });
+        ref.afterClosed().subscribe((result?: 'overwrite' | 'cancel') => {
+          this.conflictDialogOpen = false;
+          this.store.dispatch(
+            result === 'overwrite'
+              ? TableActions.confirmViewOverwrite()
+              : TableActions.cancelViewConflict(),
+          );
+        });
+      }
+    });
+
+    this.actions$
+      .pipe(ofType(TableActions.saveViewSuccess), takeUntilDestroyed())
+      .subscribe(({ activeViewId }) => {
+        const view = this.tableState().savedViews.find((item) => item.id === activeViewId);
+        this.snackBar.open(`视图「${view?.name}」已保存（v${view?.revision}）`, '关闭', { duration: 1800 });
+      });
   }
 
   refresh(): void {
     this.store.dispatch(TableActions.loadPage({ refresh: true }));
     this.snackBar.open('已刷新模拟服务端数据', '关闭', { duration: 1800 });
+  }
+
+  retry(): void {
+    this.store.dispatch(TableActions.retryFailedQuery());
+  }
+
+  setApiMode(mode: MockFailureMode): void {
+    this.mockApi.setFailureMode(mode);
+    this.apiMode.set(mode);
+    this.snackBar.open(`接口模拟已切换：${API_MODE_LABELS[mode]}`, '关闭', { duration: 1600 });
   }
 
   setSearch(search: string): void {
@@ -754,9 +906,22 @@ export class AppComponent {
   saveView(): void {
     const name = window.prompt('请输入视图名称', `视图 ${this.tableState().savedViews.length + 1}`);
     if (name?.trim()) {
-      this.store.dispatch(TableActions.saveView({ name }));
-      this.snackBar.open('当前列配置和筛选条件已保存', '关闭', { duration: 1800 });
+      this.store.dispatch(TableActions.saveView({ name: name.trim() }));
     }
+  }
+
+  simulatePeerEdit(): void {
+    const state = this.tableState();
+    const target = state.savedViews.find((view) => view.id === state.activeViewId) ?? state.savedViews[0];
+    if (!target) {
+      return;
+    }
+    this.store.dispatch(TableActions.simulateExternalViewEdit({ name: target.name }));
+    this.snackBar.open(
+      `已模拟同事在另一终端保存了「${target.name}」，你再保存同名视图会先看到双方差异`,
+      '关闭',
+      { duration: 3600 },
+    );
   }
 
   applyView(view: SavedView): void {
@@ -775,18 +940,28 @@ export class AppComponent {
     this.setGroup(null);
   }
 
+  /** 导出严格读取当前快照：分页、汇总、导出三者同源，不会混用两次查询的结果 */
   exportCsv(): void {
+    const snapshot = this.snapshot();
+    if (!snapshot) {
+      return;
+    }
     const columns = this.visibleColumns();
     const header = columns.map((column) => column.label).join(',');
-    const rows = this.tableState().rows.map((row) =>
+    const rows = snapshot.rows.map((row) =>
       columns.map((column) => `"${String(row[column.key] ?? '').replaceAll('"', '""')}"`).join(','),
     );
     const blob = new Blob([`\uFEFF${[header, ...rows].join('\n')}`], { type: 'text/csv;charset=utf-8' });
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
-    link.download = `销售订单-第${this.tableState().page + 1}页.csv`;
+    link.download = `销售订单-v${snapshot.version}-第${snapshot.request.page + 1}页.csv`;
     link.click();
     URL.revokeObjectURL(link.href);
+    this.snackBar.open(
+      `已导出快照 v${snapshot.version}：第 ${snapshot.request.page + 1} 页 ${snapshot.rows.length} 行，与当前汇总同源`,
+      '关闭',
+      { duration: 2400 },
+    );
   }
 
   private countConditions(group: FilterGroup): number {
