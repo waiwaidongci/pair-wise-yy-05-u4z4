@@ -1,9 +1,9 @@
 import { CommonModule } from '@angular/common';
-import { Component, computed, inject, signal } from '@angular/core';
+import { Component, computed, effect, inject, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { MatButtonModule } from '@angular/material/button';
 import { MatChipsModule } from '@angular/material/chips';
-import { MatDialogModule } from '@angular/material/dialog';
+import { MatDialog, MatDialogModule } from '@angular/material/dialog';
 import { MatDividerModule } from '@angular/material/divider';
 import { MatFormFieldModule } from '@angular/material/form-field';
 import { MatIconModule } from '@angular/material/icon';
@@ -16,14 +16,17 @@ import { MatSidenavModule } from '@angular/material/sidenav';
 import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
 import { MatToolbarModule } from '@angular/material/toolbar';
 import { MatTooltipModule } from '@angular/material/tooltip';
+import { Actions, ofType } from '@ngrx/effects';
 import { Store } from '@ngrx/store';
 import { DataGridComponent, GridColumn } from './components/data-grid/data-grid.component';
 import { FilterBuilderComponent } from './components/filter-builder/filter-builder.component';
+import { ViewConflictDialogComponent } from './components/view-conflict-dialog/view-conflict-dialog.component';
 import * as TableActions from './stores/table.actions';
 import {
   selectAllColumnDefinitions,
   selectPageCount,
   selectTableState,
+  selectViewConflict,
   selectVisibleColumnDefinitions,
 } from './stores/table.selectors';
 import { FilterGroup, SavedView, SortState, TableRow } from './types/table.models';
@@ -266,6 +269,19 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
             <span class="spacer"></span>
             <span class="muted">双击单元格可内联编辑</span>
           </div>
+          @if (state.queryError) {
+            <div class="query-error">
+              <mat-icon class="query-error__icon">error_outline</mat-icon>
+              <div class="query-error__text">
+                <strong>查询失败</strong>
+                <span>{{ state.queryError.message }}。已保留上一次可用结果，可从出错的那次重试。</span>
+              </div>
+              <button mat-stroked-button color="warn" type="button" (click)="retry()">
+                <mat-icon>refresh</mat-icon>
+                重试
+              </button>
+            </div>
+          }
           @if (state.loading) {
             <mat-progress-bar mode="indeterminate" />
           }
@@ -608,6 +624,34 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
       margin-left: 12px;
       color: #175cd3;
     }
+    .query-error {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 13px;
+      border-bottom: 1px solid #fecdca;
+      background: #fef3f2;
+      color: #b42318;
+      font-size: 12px;
+    }
+    .query-error__icon {
+      color: #f04438;
+      font-size: 20px;
+      width: 20px;
+      height: 20px;
+    }
+    .query-error__text {
+      display: flex;
+      flex-direction: column;
+      line-height: 1.4;
+    }
+    .query-error__text strong {
+      font-size: 13px;
+    }
+    .query-error button {
+      margin-left: auto;
+      flex-shrink: 0;
+    }
     app-data-grid {
       min-height: 0;
       flex: 1;
@@ -632,11 +676,14 @@ import { FilterGroup, SavedView, SortState, TableRow } from './types/table.model
 export class AppComponent {
   private readonly store = inject(Store);
   private readonly snackBar = inject(MatSnackBar);
+  private readonly dialog = inject(MatDialog);
+  private readonly actions$ = inject(Actions);
 
   readonly tableState = this.store.selectSignal(selectTableState);
   readonly allColumns = this.store.selectSignal(selectAllColumnDefinitions);
   readonly visibleColumns = this.store.selectSignal(selectVisibleColumnDefinitions) as unknown as () => GridColumn[];
   readonly pageCount = this.store.selectSignal(selectPageCount);
+  readonly viewConflict = this.store.selectSignal(selectViewConflict);
   readonly showFilterPanel = signal(false);
   readonly conditionCount = computed(() => this.countConditions(this.tableState().filter));
   readonly compactAmount = computed(() => {
@@ -646,13 +693,53 @@ export class AppComponent {
     return amount.toLocaleString('zh-CN');
   });
 
+  private conflictDialogOpen = false;
+
   constructor() {
     this.store.dispatch(TableActions.loadPage({ refresh: true }));
+    this.store.dispatch(TableActions.loadViews());
+
+    this.actions$.pipe(ofType(TableActions.saveViewSuccess)).subscribe(() => {
+      this.snackBar.open('视图已保存', '关闭', { duration: 1800 });
+    });
+    this.actions$.pipe(ofType(TableActions.saveViewFailure)).subscribe(({ error }) => {
+      this.snackBar.open(`视图保存失败：${error}`, '关闭', { duration: 2500 });
+    });
+    this.actions$.pipe(ofType(TableActions.deleteViewFailure)).subscribe(({ error }) => {
+      this.snackBar.open(`视图删除失败：${error}`, '关闭', { duration: 2500 });
+    });
+    this.actions$.pipe(ofType(TableActions.loadViewsFailure)).subscribe(({ error }) => {
+      this.snackBar.open(`视图加载失败：${error}`, '关闭', { duration: 2500 });
+    });
+
+    effect(() => {
+      const conflict = this.viewConflict();
+      if (conflict && !this.conflictDialogOpen) {
+        this.conflictDialogOpen = true;
+        const dialogRef = this.dialog.open(ViewConflictDialogComponent, {
+          width: '680px',
+          maxWidth: '92vw',
+          data: conflict,
+        });
+        dialogRef.afterClosed().subscribe((result) => {
+          this.conflictDialogOpen = false;
+          if (result === 'confirm') {
+            this.store.dispatch(TableActions.confirmOverwriteView());
+          } else {
+            this.store.dispatch(TableActions.cancelViewConflict());
+          }
+        });
+      }
+    });
   }
 
   refresh(): void {
     this.store.dispatch(TableActions.loadPage({ refresh: true }));
     this.snackBar.open('已刷新模拟服务端数据', '关闭', { duration: 1800 });
+  }
+
+  retry(): void {
+    this.store.dispatch(TableActions.retryQuery());
   }
 
   setSearch(search: string): void {
@@ -755,7 +842,6 @@ export class AppComponent {
     const name = window.prompt('请输入视图名称', `视图 ${this.tableState().savedViews.length + 1}`);
     if (name?.trim()) {
       this.store.dispatch(TableActions.saveView({ name }));
-      this.snackBar.open('当前列配置和筛选条件已保存', '关闭', { duration: 1800 });
     }
   }
 
@@ -776,17 +862,8 @@ export class AppComponent {
   }
 
   exportCsv(): void {
-    const columns = this.visibleColumns();
-    const header = columns.map((column) => column.label).join(',');
-    const rows = this.tableState().rows.map((row) =>
-      columns.map((column) => `"${String(row[column.key] ?? '').replaceAll('"', '""')}"`).join(','),
-    );
-    const blob = new Blob([`\uFEFF${[header, ...rows].join('\n')}`], { type: 'text/csv;charset=utf-8' });
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = `销售订单-第${this.tableState().page + 1}页.csv`;
-    link.click();
-    URL.revokeObjectURL(link.href);
+    // 导出走效应：与当前分页、订单汇总共用同一份快照，不在组件里拼两次查询。
+    this.store.dispatch(TableActions.exportCsv());
   }
 
   private countConditions(group: FilterGroup): number {

@@ -62,6 +62,7 @@ export interface ColumnDefinition {
 }
 
 export interface QueryRequest {
+  version: number;
   page: number;
   pageSize: number;
   sort: SortState | null;
@@ -85,6 +86,7 @@ export interface GroupSummary {
 }
 
 export interface QueryResult {
+  version: number;
   rows: TableRow[];
   total: number;
   aggregates: AggregateResult;
@@ -92,10 +94,29 @@ export interface QueryResult {
   elapsedMs: number;
 }
 
+/** 一次成功查询留下的可用快照，分页、订单汇总与导出共用同一份。 */
+export interface QuerySnapshot {
+  version: number;
+  rows: TableRow[];
+  total: number;
+  groups: GroupSummary[];
+  aggregates: AggregateResult;
+  elapsedMs: number;
+  request: QueryRequest;
+}
+
+/** 一次失败查询的现场，用于“从出错的那次重试”。 */
+export interface QueryFailure {
+  message: string;
+  version: number;
+  request: QueryRequest;
+}
+
 export interface SavedView {
   id: string;
   name: string;
   createdAt: string;
+  updatedAt: string;
   pageSize: number;
   visibleColumns: Array<keyof TableRow>;
   columnWidths: Record<string, number>;
@@ -130,4 +151,14 @@ export interface TableState {
   savedViews: SavedView[];
   activeViewId: string | null;
   dirtyCells: Record<string, CellValue>;
+  /** 查询世代号：每次条件改动或刷新自增，旧结果据此失效。 */
+  queryVersion: number;
+  /** 当前展示的快照所属世代；查询失败时保留上一世代快照。 */
+  snapshotVersion: number | null;
+  /** 当前快照对应的查询条件，供导出与重试核对。 */
+  lastRequest: QueryRequest | null;
+  /** 最近一次失败查询的现场（含版本与条件），用于重试。 */
+  queryError: QueryFailure | null;
+  /** 待确认的视图覆盖冲突。 */
+  pendingViewConflict: { existing: SavedView; candidate: SavedView; remoteChanged: boolean } | null;
 }

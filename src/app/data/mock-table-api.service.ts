@@ -1,5 +1,5 @@
 import { Injectable } from '@angular/core';
-import { Observable, of } from 'rxjs';
+import { Observable, of, throwError } from 'rxjs';
 import { delay } from 'rxjs/operators';
 import {
   AggregateResult,
@@ -21,9 +21,14 @@ const STATUSES: TableRow['status'][] = ['待审核', '进行中', '已发货', '
 @Injectable({ providedIn: 'root' })
 export class MockTableApiService {
   private readonly rows: TableRow[] = this.createRows(50000);
+  /** 按查询世代记录失败次数，用于“重试后成功”的瞬态故障模拟。 */
+  private readonly attemptsByVersion = new Map<number, number>();
 
   query(request: QueryRequest): Observable<QueryResult> {
     const startedAt = performance.now();
+    const attempt = (this.attemptsByVersion.get(request.version) ?? 0) + 1;
+    this.attemptsByVersion.set(request.version, attempt);
+
     const filtered = this.filterRows(this.rows, request.filter, request.search);
     const sorted = this.sortRows(filtered, request.sort);
     const groups = request.groupBy ? this.groupRows(sorted, request.groupBy) : [];
@@ -53,13 +58,25 @@ export class MockTableApiService {
     }
 
     const elapsedMs = Math.max(8, Math.round(performance.now() - startedAt + 18));
-    return of({
+    const result: QueryResult = {
+      version: request.version,
       rows: pageRows,
       total,
       aggregates: this.aggregate(sorted),
       groups,
       elapsedMs,
-    }).pipe(delay(request.page > 8 ? 120 : 55));
+    };
+
+    // 深分页（第 10 页起）首次请求模拟服务端超时，重试同一版本即可成功。
+    if (request.page > 9 && attempt === 1) {
+      return throwError(() => new Error('模拟服务端错误：深分页查询超时，请重试')).pipe(
+        delay(350),
+      );
+    }
+
+    // 随机网络延迟：慢查询可能后发先至，配合 switchMap 取消与版本守卫保证旧结果不覆盖。
+    const latency = 30 + Math.floor(Math.random() * 340);
+    return of(result).pipe(delay(latency));
   }
 
   getDatasetSize(): number {
